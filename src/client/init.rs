@@ -3,6 +3,8 @@ use std::error::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedWriteHalf;
+use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::watch;
 
 use crate::consumer::inti::consumer;
 use crate::producer::init::producer;
@@ -12,10 +14,15 @@ use crate::producer::init::producer;
 
 
 pub struct client{
-    socket:OwnedWriteHalf,
+    // socket:OwnedWriteHalf,
     consumer:consumer,
-    producer:producer
+    producer:producer,
+
+    request_queue_signal:Sender<Vec<u8>>,
+    response_signal: watch::Receiver<Vec<u8>>,
 }
+
+
 
 
 impl client {
@@ -24,6 +31,10 @@ impl client {
 
         let (mut reader, writer) = socket.into_split();
 
+        let (response_tx, response_rx) =watch::channel(Vec::<u8>::new());
+
+        let response_tx_clone = response_tx.clone();
+        
         tokio::spawn(async move {
             loop {
                 // -------------------------
@@ -65,8 +76,9 @@ impl client {
                 // -------------------------
 
                 if ack {
-                    println!("Request succeeded");
-                    println!("Response: {:?}", response);
+                    // println!("ACK recived");
+                    // println!("Response: {:?}", response);
+                    let _ =response_tx_clone.send(response);
                 } else {
                     println!(
                         "Request failed: {}",
@@ -76,12 +88,192 @@ impl client {
             }
         });
 
+
+
         Ok(Self {
-            socket: writer,
+            
             consumer: consumer::new(),
             producer: producer::new(),
+            request_queue_signal:client::RequestQueue(writer),
+            response_signal:response_rx
         })
     }
+
+    
+
+    fn RequestQueue(mut stream: OwnedWriteHalf) -> Sender<Vec<u8>> {
+        let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(1024);
+
+        tokio::spawn(async move {
+            const MAX_BATCH_SIZE: usize = 64 * 1024;
+            const MAX_REQUESTS: u64 = 100;
+            const BATCH_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_millis(1);
+
+            let mut buffer = Vec::new();
+            let mut request_count: u64 = 0;
+
+            loop {
+                let request = if request_count == 0 {
+                    match receiver.recv().await {
+                        Some(request) => request,
+                        None => break,
+                    }
+                } else {
+                    match tokio::time::timeout(
+                        BATCH_TIMEOUT,
+                        receiver.recv(),
+                    )
+                    .await
+                    {
+                        Ok(Some(request)) => request,
+
+                        Ok(None) => {
+                            break;
+                        }
+
+                        Err(_) => {
+                            // -----------------------------
+                            // Timeout -> flush batch
+                            // -----------------------------
+
+                            let buffer_len =
+                                buffer.len() as u64;
+
+                            let mut batch =
+                                Vec::with_capacity(
+                                    16 + buffer.len()
+                                );
+
+                            // Number of requests
+                            batch.extend_from_slice(
+                                &request_count.to_be_bytes()
+                            );
+
+                            // Total buffer length
+                            batch.extend_from_slice(
+                                &buffer_len.to_be_bytes()
+                            );
+
+                            // All requests
+                            batch.extend_from_slice(&buffer);
+
+                            if let Err(e) =
+                                stream.write_all(&batch).await
+                            {
+                                eprintln!(
+                                    "Failed to send batch: {}",
+                                    e
+                                );
+                                break;
+                            }
+
+                            buffer.clear();
+                            request_count = 0;
+
+                            continue;
+                        }
+                    }
+                };
+
+                // -----------------------------
+                // Add request to batch
+                // -----------------------------
+
+                let request_len =
+                    (request.len() as u64).to_be_bytes();
+
+                buffer.extend_from_slice(&request_len);
+                buffer.extend_from_slice(&request);
+
+                request_count += 1;
+
+                // -----------------------------
+                // Flush if batch is full
+                // -----------------------------
+
+                if buffer.len() >= MAX_BATCH_SIZE
+                    || request_count >= MAX_REQUESTS
+                {
+                    let buffer_len =
+                        buffer.len() as u64;
+
+                    let mut batch =
+                        Vec::with_capacity(
+                            16 + buffer.len()
+                        );
+
+                    // Number of requests
+                    batch.extend_from_slice(
+                        &request_count.to_be_bytes()
+                    );
+
+                    // Total buffer length
+                    batch.extend_from_slice(
+                        &buffer_len.to_be_bytes()
+                    );
+
+                    // All requests
+                    batch.extend_from_slice(&buffer);
+
+                    // Send
+                    if let Err(e) =
+                        stream.write_all(&batch).await
+                    {
+                        eprintln!(
+                            "Failed to send batch: {}",
+                            e
+                        );
+                        break;
+                    }
+
+                    // Reset
+                    buffer.clear();
+                    request_count = 0;
+                }
+            }
+
+            // -----------------------------
+            // Flush remaining requests
+            // -----------------------------
+
+            if request_count > 0 {
+                let buffer_len =
+                    buffer.len() as u64;
+
+                let mut batch =
+                    Vec::with_capacity(
+                        16 + buffer.len()
+                    );
+
+                // Number of requests
+                batch.extend_from_slice(
+                    &request_count.to_be_bytes()
+                );
+
+                // Total buffer length
+                batch.extend_from_slice(
+                    &buffer_len.to_be_bytes()
+                );
+
+                // All requests
+                batch.extend_from_slice(&buffer);
+
+                if let Err(e) =
+                    stream.write_all(&batch).await
+                {
+                    eprintln!(
+                        "Failed to send final batch: {}",
+                        e
+                    );
+                }
+            }
+        });
+
+        sender
+    }
+
+
 
     pub async fn CreateSocket() -> Result<TcpStream, Box<dyn Error>> {
         let addr = std::env::var("server_addr")
@@ -97,7 +289,7 @@ impl client {
         topic_name: String,
         partition_no: u64,
     ) -> Result<(), Box<dyn Error>> {
-        let op = b"topic_insert";
+        let op = "topic_insert".as_bytes();
         let op_len = (op.len() as u64).to_be_bytes();
 
         let topic_buf = topic_name.as_bytes();
@@ -116,16 +308,22 @@ impl client {
         buf.extend_from_slice(&partition_buf);
 
         // Total payload length
-        let buf_len = (buf.len() as u64).to_be_bytes();
+        // let buf_len = (buf.len() as u64).to_be_bytes();
 
-        let mut final_buf = Vec::with_capacity(8 + buf.len());
+        // let mut final_buf = Vec::new();
 
-        final_buf.extend_from_slice(&buf_len);
-        final_buf.extend_from_slice(&buf);
+        // final_buf.extend_from_slice(&buf_len);
+        // final_buf.extend_from_slice(&buf);
 
         // Send to server
-        self.socket.write_all(&final_buf).await?;
+        self.request_queue_signal.send(buf).await?;
 
+        let res=self.response_signal.borrow().clone();
+
+        self.response_signal.changed().await?;
+
+        let res = self.response_signal.borrow().clone();
+        
         Ok(())
     }
 
@@ -170,18 +368,19 @@ impl client {
         buf.extend_from_slice(value_buf);
 
         // Total payload length
-        let buf_len = (buf.len() as u64).to_be_bytes();
+        // let buf_len = (buf.len() as u64).to_be_bytes();
 
-        let mut final_buf = Vec::with_capacity(8 + buf.len());
+        // let mut final_buf = Vec::with_capacity(8 + buf.len());
 
-        final_buf.extend_from_slice(&buf_len);
-        final_buf.extend_from_slice(&buf);
+        // final_buf.extend_from_slice(&buf_len);
+        // final_buf.extend_from_slice(&buf);
 
         // Send to server
-        self.socket.write_all(&final_buf).await?;
+        self.request_queue_signal.send(buf).await?;
 
         Ok(())
     }
 
+    
 }
 

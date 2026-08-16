@@ -1,0 +1,5 @@
+sudo ./target/release/msg-broker
+
+
+
+cargo build --release

@@ -1,0 +1,23 @@
+wget https://downloads.apache.org/kafka/4.3.1/kafka_2.13-4.3.1.tgz
+
+
+tar -xzf kafka_2.13-4.3.1.tgz
+cd kafka_2.13-4.3.1
+
+
+
+
+to remove teh log file 
+rm kafka-producer-benchmark.log
+
+
+
+
+
+
+bin/kafka-topics.sh \
+  --create \
+  --topic benchmark \
+  --partitions 10 \
+  --replication-factor 1 \
+  --bootstrap-server localhost:9092

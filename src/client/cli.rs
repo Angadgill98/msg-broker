@@ -14,7 +14,6 @@ impl Cli {
         dotenvy::dotenv().ok();
 
 
-        println!("Connected to server.");
         println!("Commands:");
         println!("  topic <name> <partitions>");
         println!("  insert <topic> <key> <value>");
