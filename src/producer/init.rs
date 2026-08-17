@@ -19,6 +19,7 @@ async fn CreateSocket() -> Result<TcpStream, Box<dyn Error>> {
 
 pub struct producer{
     topics:Vec<topics>
+    
 }
 
 impl producer {
