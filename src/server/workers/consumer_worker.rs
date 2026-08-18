@@ -394,7 +394,7 @@ for partition in topic.partitions.values() {
                     Arc::clone(&server),
                     client_addr,
                     true,
-                    Vec::new(),
+                    consumer_id.to_be_bytes().to_vec(),
                 ))
                 .await
             {

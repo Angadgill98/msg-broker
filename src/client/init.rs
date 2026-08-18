@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::error::Error;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::watch;
 
 use crate::consumer::inti::consumer;
@@ -20,6 +21,7 @@ pub struct client{
 
     request_queue_signal:Sender<Vec<u8>>,
     response_signal: watch::Receiver<Vec<u8>>,
+    consumer_socket:Sender<Vec<u8>>
 }
 
 
@@ -34,7 +36,8 @@ impl client {
         let (response_tx, response_rx) =watch::channel(Vec::<u8>::new());
 
         let response_tx_clone = response_tx.clone();
-        
+
+    
         tokio::spawn(async move {
             loop {
                 // -------------------------
@@ -89,18 +92,76 @@ impl client {
         });
 
 
+        let consumer_socket: TcpStream=client::CreateSocket().await?;
 
+        let(mut consumer_reader,consumer_writer)=consumer_socket.into_split();
+
+        let (consumer_response_tx, consumer_response_rx) =mpsc::channel(1024);
+
+        tokio::spawn(async move {
+            loop {
+                // -------------------------
+                // Read ACK
+                // -------------------------
+                let mut ack_buf = [0u8; 1];
+
+                if let Err(e) = consumer_reader.read_exact(&mut ack_buf).await {
+                    eprintln!("Server connection closed: {}", e);
+                    break;
+                }
+
+                let ack = ack_buf[0] == 1;
+
+                // -------------------------
+                // Read response length
+                // -------------------------
+                let mut len_buf = [0u8; 8];
+
+                if let Err(e) = consumer_reader.read_exact(&mut len_buf).await {
+                    eprintln!("Failed to read response length: {}", e);
+                    break;
+                }
+
+                let len = u64::from_be_bytes(len_buf) as usize;
+
+                // -------------------------
+                // Read response
+                // -------------------------
+                let mut response = vec![0u8; len];
+
+                if let Err(e) = consumer_reader.read_exact(&mut response).await {
+                    eprintln!("Failed to read response: {}", e);
+                    break;
+                }
+
+                // -------------------------
+                // Handle response
+                // -------------------------
+
+                if ack {
+                    println!("ACK recived");
+                    println!("Response: {:?}", response);
+                } else {
+                    println!(
+                        "Request failed: {}",
+                        String::from_utf8_lossy(&response)
+                    );
+                }
+            }
+        });
+
+      
         Ok(Self {
             
             consumer: consumer::new(),
             producer: producer::new(),
             request_queue_signal:client::RequestQueue(writer),
-            response_signal:response_rx
+            response_signal:response_rx,
+            consumer_socket:consumer_response_tx
         })
     }
 
     
-
     fn RequestQueue(mut stream: OwnedWriteHalf) -> Sender<Vec<u8>> {
         let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(1024);
 
@@ -273,8 +334,7 @@ impl client {
         sender
     }
 
-
-
+    
     pub async fn CreateSocket() -> Result<TcpStream, Box<dyn Error>> {
         let addr = std::env::var("server_addr")
             .map_err(|_| "Environment variable 'server_addr' not defined")?;
