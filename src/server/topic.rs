@@ -32,6 +32,7 @@ impl TopicMap {
 pub struct topic {
     pub partition_no: usize,
     pub partitions: HashMap<usize, Arc<RwLock<partition::Partition>>>,
+    pub consumer_no:usize
 }
 
 impl topic {
@@ -41,6 +42,7 @@ impl topic {
         Ok(Self {
             partition_no,
             partitions,
+            consumer_no:0
         })
     }
 }

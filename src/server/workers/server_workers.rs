@@ -2,12 +2,11 @@ use std::{error::Error, net::SocketAddr, sync::Arc};
 
 use tokio::sync::{RwLock, mpsc, oneshot};
 
-use crate::server::{self, partition, topic};
+use crate::server::{self, partition, topic, workers::consumer_worker};
 
 pub fn RequestPool() -> mpsc::Sender<(Arc<RwLock<server::init::server>>,Vec<u8>,Vec<u8>,SocketAddr)> {
     let (sender, mut queue) =mpsc::channel::<(Arc<RwLock<server::init::server>>,Vec<u8>,Vec<u8>,SocketAddr,)>(1024);
     let worker_queue =InitWorkers(4);
-
     tokio::spawn(async move {
         let mut previous_receiver:Option<oneshot::Receiver<bool>> =None;
 
@@ -17,6 +16,8 @@ pub fn RequestPool() -> mpsc::Sender<(Arc<RwLock<server::init::server>>,Vec<u8>,
             let previous =previous_receiver.take();
 
             previous_receiver =Some(signal_receiver);
+
+            
 
             if let Err(e) =
                 worker_queue
@@ -30,7 +31,7 @@ pub fn RequestPool() -> mpsc::Sender<(Arc<RwLock<server::init::server>>,Vec<u8>,
                     ))
                     .await
             {
-                eprintln!("Failed to queue request into worker queue: {}",e);
+                eprintln!("Failed to queue request into producer worker queue: {}",e);
                 break;
             }
         }
@@ -58,13 +59,15 @@ fn InitWorkers(worker_count: usize) -> mpsc::Sender<WorkerRequest> {
         }
 
         let mut worker_senders =Vec::new();
+        let consumer_reg_queue=consumer_worker::ConsumerReg();
 
         for _ in 0..worker_count {
             let (worker_sender,mut worker_queue) = mpsc::channel::<WorkerRequest>(256);
-
+            let consumer_req_queue=consumer_reg_queue.clone();
             worker_senders.push(worker_sender);
 
             tokio::spawn(async move {
+
                 while let Some((
                     server,
                     operation,
@@ -74,38 +77,66 @@ fn InitWorkers(worker_count: usize) -> mpsc::Sender<WorkerRequest> {
                     client_addr,
                 )) = worker_queue.recv().await
                 {
-                    let result =HandleOperation(&server,operation,payload).await;
+                    let result =HandleOperation(&server,operation.clone(),payload).await;
 
+                    
                     match result {
-                        Ok(Some((value,partition))) => {
-                            if let Some(previous_receiver) = previous_receiver{
-                                if let Err(e) =previous_receiver.await{
-                                    eprintln!("Previous request signal failed: {}",e);
+                        Ok(t)=>{
+                            match t {
+                                Some(OperationResult::Producer {value,partition}) =>{
+                                    
+                                    if let Some(previous_receiver) = previous_receiver{
+                                        if let Err(e) =previous_receiver.await{
+                                            eprintln!("Previous request signal failed: {}",e);
+                                        }
+                                    }
+
+                                    let partition_worker_pool ={
+                                        let server_guard =server.read().await;
+
+                                        server_guard.partition_worker_pool.clone()
+                                    };
+
+                                    if let Err(e) =
+                                        partition_worker_pool.send((Arc::clone(&server),partition,value,client_addr)).await{
+                                        eprintln!("Failed to queue partition write: {}",e);
+                                    }
+
+                                    let _ =signal_sender.send(true);
                                 }
-                            }
+                                
+                                Some(OperationResult::Subscribe { topic, group_name, start_point })=>{
+                                    
+                                    if let Some(previous_receiver) = previous_receiver{
+                                        if let Err(e) =previous_receiver.await{
+                                            eprintln!("Previous request signal failed: {}",e);
+                                        }
+                                    }
 
-                            let partition_worker_pool ={
-                                let server_guard =server.read().await;
+                                    if let Err(e) = consumer_req_queue
+                                        .send((
+                                            Arc::clone(&server),
+                                            topic,
+                                            group_name,
+                                            start_point,
+                                            client_addr,
 
-                                server_guard.partition_worker_pool.clone()
-                            };
-
-                            if let Err(e) =
-                                partition_worker_pool.send((Arc::clone(&server),partition,value,client_addr)).await{
-                                eprintln!("Failed to queue partition write: {}",e);
-                            }
-
-                            let _ =signal_sender.send(true);
-                        }
-
-                        
-
-                        Ok(None) => {
-                            let response_writer_signal = {
+                                        ))
+                                        .await
+                                    {
+                                        eprintln!(
+                                            "Failed to queue consumer registration: {}",
+                                            e
+                                        );
+                                    }
+                                    let _ =signal_sender.send(true);
+                                }
+                                None=>{
+                                     let response_writer_signal = {
                                 let server_guard =server.read().await;
                                 server_guard.response_pool.clone()
                             };
-
+                            println!("asdasdas");
 
                             if let Err(e) =
                                 response_writer_signal
@@ -121,7 +152,36 @@ fn InitWorkers(worker_count: usize) -> mpsc::Sender<WorkerRequest> {
                             }
 
                             let _ =signal_sender.send(true);
+                                }
+                                
+                            }
                         }
+                        
+
+                        
+
+                        // Ok(None) => {
+                        //     let response_writer_signal = {
+                        //         let server_guard =server.read().await;
+                        //         server_guard.response_pool.clone()
+                        //     };
+
+
+                        //     if let Err(e) =
+                        //         response_writer_signal
+                        //             .send((
+                        //                 Arc::clone(&server),
+                        //                 client_addr,
+                        //                 true,
+                        //                 Vec::new(),
+                        //             ))
+                        //             .await
+                        //     {
+                        //         eprintln!("Failed to queue response: {}",e);
+                        //     }
+
+                        //     let _ =signal_sender.send(true);
+                        // }
 
                         Err(e) => {
                             let response_writer_signal = {
@@ -178,13 +238,24 @@ fn InitWorkers(worker_count: usize) -> mpsc::Sender<WorkerRequest> {
 
 
 
+enum OperationResult {
+    Producer {
+        value: Vec<u8>,
+        partition: Arc<RwLock<partition::Partition>>,
+    },
+
+    Subscribe {
+        topic:Vec<u8>,
+        group_name: Vec<u8>,
+        start_point: Vec<u8>,
+    },
+}
 
 
 
 
 
-
-async fn HandleOperation(server: &Arc<RwLock<server::init::server>>,operation: Vec<u8>,payload: Vec<u8>) -> Result<Option<(Vec<u8>,Arc<RwLock<partition::Partition>>,)>,Box<dyn std::error::Error + Send + Sync>,> {
+async fn HandleOperation(server: &Arc<RwLock<server::init::server>>,operation: Vec<u8>,payload: Vec<u8>) -> Result<Option<OperationResult>,Box<dyn std::error::Error + Send + Sync>,> {
     let operation =String::from_utf8(operation)
             .map_err(|e| { format!("Invalid operation UTF-8: {}",e)})?;
 
@@ -280,10 +351,22 @@ async fn HandleOperation(server: &Arc<RwLock<server::init::server>>,operation: V
                 Arc::clone(partition)
             };
 
-            Ok(Some((
-                value_buf,
+            
+
+            Ok(Some(OperationResult::Producer {
+                value:value_buf,
                 partition,
-            )))
+            }))
+        }
+
+        "subscribe"=>{
+            let (topic_name_buf,payload) = Simplify(payload)?;
+
+            let (group_name_buf,payload) = Simplify(payload)?;
+
+            let (start_buf,_)=Simplify(payload)?;
+
+            Ok(Some(OperationResult::Subscribe { topic: topic_name_buf, group_name: group_name_buf, start_point: start_buf }))
         }
 
         unknown => {

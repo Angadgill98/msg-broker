@@ -1,10 +1,20 @@
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr};
 
 
 
 #[derive(Debug)]
+#[derive(Clone)]
 pub struct Consumer {
-    consumer_addr: SocketAddr,
-    start_point: usize,
-    offset: usize,
+    pub consumer_id:i64,
+    pub consumer_addr: SocketAddr,
+    pub start_point: usize,
+    pub offset: usize,
+    pub group_name:Vec<u8>
 }
+
+#[derive(Debug, Clone)]
+pub struct Consumergrp {
+    pub grp: HashMap<Vec<u8>, Vec<i64>>,
+    pub consumers: HashMap<i64, Consumer>,
+}
+

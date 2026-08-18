@@ -12,7 +12,7 @@ use crate::server::consumer;
 pub struct Partition {
     id: usize,
     file_name: String,
-    consumers: Vec<consumer::Consumer>,
+    pub consumers: Arc<RwLock<Vec<consumer::Consumer>>> ,
 }
 
 impl Partition {
@@ -75,7 +75,7 @@ pub fn CreatePartitions(topic_name: &[u8],partition_no: usize,) -> Result<HashMa
         let partition = Partition {
             id: i,
             file_name,
-            consumers: Vec::new(),
+            consumers: Arc::new(RwLock::new(Vec::new())),
         };
 
         partitions.insert(

@@ -20,7 +20,7 @@ use tokio::{
     },
 };
 
-use crate::server::topic;
+use crate::server::{consumer, topic};
 use crate::server::workers::server_workers;
 use crate::server::{partition, workers};
 
@@ -32,14 +32,11 @@ pub struct server {
     pub shard_count: usize,
     request_pool:Sender<(Arc<RwLock<server>>, Vec<u8>, Vec<u8>, SocketAddr)>,
     pub partition_worker_pool: Sender<workers::partition_worker::PartitionPoolRequest>,
+    
     pub response_pool: Sender<ResponseRequest>,
+
+    pub consumer_grp:Arc<RwLock<consumer::Consumergrp>>
 }
-
-
-
-
-
-
 
 type ResponseRequest = (
     Arc<RwLock<server>>,
@@ -48,17 +45,9 @@ type ResponseRequest = (
     Vec<u8>,
 );
 
-type ConsumerWorkerRequest = (
-    Arc<server>,
-    Arc<RwLock<partition::Partition>>,
-    SocketAddr,
-);
-
-
-
 #[derive(Hash, Eq, PartialEq)]
 #[derive(Debug)]
-struct Shard(usize);
+pub struct Shard(pub usize);
 
 impl server {
     fn new(shard_count: usize) -> Result<Self, Box<dyn Error + Send + Sync>> {
@@ -79,6 +68,10 @@ impl server {
             request_pool:request_pool,
             partition_worker_pool,
             response_pool:response_pool,
+            consumer_grp:Arc::new(RwLock::new(consumer::Consumergrp{
+                grp:HashMap::new(),
+                consumers:HashMap::new()
+            }))
         })
     }
 
@@ -118,6 +111,8 @@ impl server {
                 output.extend_from_slice(&response_len.to_be_bytes());
 
                 output.extend_from_slice(&response);
+
+                // println!("server is {:?}",server);
 
                 if let Err(e) =client_guard.write_all(&output).await{
                     eprintln!("Failed to send response to {}: {}",client_addr,e);
@@ -202,7 +197,6 @@ pub async fn Init(server_ready:tokio::sync::oneshot::Sender<()>,) {
                 continue;
             }
         };
-
         println!("Client connected: {}",client_addr);
 
         let server =Arc::clone(&server);
@@ -217,6 +211,7 @@ pub async fn Init(server_ready:tokio::sync::oneshot::Sender<()>,) {
             }
 
             let server =Arc::clone(&server);
+            let addr=client_addr.to_string();
 
             'connection: loop {
                 let mut count_buf =[0u8; 8];
@@ -264,7 +259,7 @@ pub async fn Init(server_ready:tokio::sync::oneshot::Sender<()>,) {
 
                     remaining_buf =remaining;
 
-                    let (operation,payload,) = match server_workers::Simplify(request) {
+                    let (operation,mut payload,) = match server_workers::Simplify(request) {
                         Ok(result) =>result,
 
                         Err(e) => {
@@ -278,6 +273,12 @@ pub async fn Init(server_ready:tokio::sync::oneshot::Sender<()>,) {
 
                         server_guard.request_pool.clone()
                     };
+
+                    // let addr_buf=addr.as_bytes();
+                    // let addr_len=(addr_buf.len() as u64).to_be_bytes();
+
+                    // payload.extend_from_slice(&addr_len);
+                    // payload.extend_from_slice(addr_buf);
 
                     if let Err(e) =request_pool
                         .send((

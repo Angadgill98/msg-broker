@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use tokio::sync::{RwLock, mpsc, oneshot};
 
-use crate::server::{self, partition};
+use crate::server::{self, partition, workers::consumer_worker};
 
 
 
@@ -31,12 +31,12 @@ pub fn PartitionPool(worker_count: usize,) -> mpsc::Sender<PartitionPoolRequest>
     
 
     let mut worker_senders = Vec::new();
-
+    let consumer_ppol=consumer_worker::ConsumerPool(4);
     for _ in 0..worker_count {
         let (worker_sender,mut worker_receiver,) = mpsc::channel::<PartitionWorkerTask>(256);
 
         worker_senders.push(worker_sender);
-
+        let consumer_pool=consumer_ppol.clone();
         tokio::spawn(async move {
             while let Some(task) =worker_receiver.recv().await{
                 let PartitionWorkerTask {
@@ -83,7 +83,7 @@ pub fn PartitionPool(worker_count: usize,) -> mpsc::Sender<PartitionPoolRequest>
                     server_guard.response_pool.clone()
                 };
 
-                match partition_guard.WriteTOFile(value){
+                match partition_guard.WriteTOFile(value.clone()){
                     Ok(()) => {
                         // println!(
                         //     "Partition write completed"
@@ -101,6 +101,21 @@ pub fn PartitionPool(worker_count: usize,) -> mpsc::Sender<PartitionPoolRequest>
                         {
                             eprintln!(
                                 "Failed to queue success response: {}",
+                                e
+                            );
+                        }
+                        if let Err(e) =
+                        consumer_pool
+                            .send((
+                                Arc::clone(&server),
+                                Arc::clone(&partition),
+                                value,
+                                client_addr,
+                            ))
+                            .await
+                        {
+                            eprintln!(
+                                "Failed to queue consumer notification: {}",
                                 e
                             );
                         }
@@ -125,6 +140,7 @@ pub fn PartitionPool(worker_count: usize,) -> mpsc::Sender<PartitionPoolRequest>
                                 send_err
                             );
                         }
+
                     }
                 }
 
@@ -147,56 +163,56 @@ pub fn PartitionPool(worker_count: usize,) -> mpsc::Sender<PartitionPoolRequest>
     }
 
         
-        tokio::spawn(async move {
-            let mut next_worker = 0;
+    tokio::spawn(async move {
+        let mut next_worker = 0;
 
-            let mut previous_signal:
-                Option<oneshot::Receiver<()>> = None;
+        let mut previous_signal:
+            Option<oneshot::Receiver<()>> = None;
 
-            while let Some(request) =queue.recv().await{
-            
+        while let Some(request) =queue.recv().await{
+        
 
-                if worker_senders.is_empty() {
-                    eprintln!(
-                        "No partition workers available"
-                    );
-                    break;
-                }
-
-                // Create the signal that THIS request will
-                // send when its partition write is finished.
-                let (
-                    completion_signal,
-                    completion_receiver,
-                ) = oneshot::channel::<()>();
-
-                let task = PartitionWorkerTask {
-                    request,
-                    previous_signal: previous_signal.take(),
-                    completion_signal,
-                };
-
-                // The receiver becomes the "previous signal"
-                // for the NEXT request.
-                previous_signal =
-                    Some(completion_receiver);
-
-                if let Err(e) =
-                    worker_senders[next_worker]
-                        .send(task)
-                        .await
-                {
-                    eprintln!(
-                        "Failed to dispatch partition request: {}",
-                        e
-                    );
-                    break;
-                }
-
-                next_worker =
-                    (next_worker + 1)
-                        % worker_senders.len();
+            if worker_senders.is_empty() {
+                eprintln!(
+                    "No partition workers available"
+                );
+                break;
             }
-        });
-        sender
-    }
+
+            // Create the signal that THIS request will
+            // send when its partition write is finished.
+            let (
+                completion_signal,
+                completion_receiver,
+            ) = oneshot::channel::<()>();
+
+            let task = PartitionWorkerTask {
+                request,
+                previous_signal: previous_signal.take(),
+                completion_signal,
+            };
+
+            // The receiver becomes the "previous signal"
+            // for the NEXT request.
+            previous_signal =
+                Some(completion_receiver);
+
+            if let Err(e) =
+                worker_senders[next_worker]
+                    .send(task)
+                    .await
+            {
+                eprintln!(
+                    "Failed to dispatch partition request: {}",
+                    e
+                );
+                break;
+            }
+
+            next_worker =
+                (next_worker + 1)
+                    % worker_senders.len();
+        }
+    });
+    sender
+}

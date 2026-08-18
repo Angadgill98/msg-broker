@@ -76,8 +76,8 @@ impl client {
                 // -------------------------
 
                 if ack {
-                    // println!("ACK recived");
-                    // println!("Response: {:?}", response);
+                    println!("ACK recived");
+                    println!("Response: {:?}", response);
                     let _ =response_tx_clone.send(response);
                 } else {
                     println!(
@@ -323,7 +323,7 @@ impl client {
         self.response_signal.changed().await?;
 
         let res = self.response_signal.borrow().clone();
-        
+        println!("res came ");
         Ok(())
     }
 
@@ -381,6 +381,66 @@ impl client {
         Ok(())
     }
 
-    
+    pub async fn subscribe(
+        &mut self,
+        topic: String,
+        group_name: String,
+        start_point: usize,
+    ) -> Result<(), Box<dyn Error>> {
+
+        let mut buf = Vec::new();
+
+        // -------------------------------------------------
+        // Operation
+        // -------------------------------------------------
+
+        let op = b"subscribe";
+        let op_len = (op.len() as u64).to_be_bytes();
+
+        buf.extend_from_slice(&op_len);
+        buf.extend_from_slice(op);
+
+        // -------------------------------------------------
+        // Topic
+        // -------------------------------------------------
+
+        let topic_buf = topic.as_bytes();
+        let topic_len = (topic_buf.len() as u64).to_be_bytes();
+
+        buf.extend_from_slice(&topic_len);
+        buf.extend_from_slice(topic_buf);
+
+        // -------------------------------------------------
+        // Key
+        // -------------------------------------------------
+
+        let grp_buf = group_name.as_bytes();
+        let grp_len = (grp_buf.len() as u64).to_be_bytes();
+
+        buf.extend_from_slice(&grp_len);
+        buf.extend_from_slice(grp_buf);
+
+        // -------------------------------------------------
+        // Start point
+        // -------------------------------------------------
+
+        let start_point_buf = (start_point as u64).to_be_bytes();
+
+        let start_point_len =
+            (start_point_buf.len() as u64).to_be_bytes();
+
+        buf.extend_from_slice(&start_point_len);
+        buf.extend_from_slice(&start_point_buf);
+
+        // -------------------------------------------------
+        // Send request
+        // -------------------------------------------------
+
+        self.request_queue_signal
+            .send(buf)
+            .await?;
+
+        Ok(())
+    }
 }
 
